@@ -1,0 +1,336 @@
+#!/bin/bash
+#
+#  monitor changes to gitsync data dir
+#
+#  see cron entry .. config file sourced from cron
+#
+
+export INOTIFYWAIT='/usr/bin/inotifywait --recursive --exclude \.gitsync'
+export RSYNCOPTS=" --archive --checksum --dry-run "
+export RSYNCOPTS="$RSYNCOPTS --exclude=*.swp --exclude=.gitsync"
+export RSYNCOPTS="$RSYNCOPTS --cvs-exclude --delete --itemize-changes "
+export TIMEONLY='^\.f\.\.t'
+export TIMEONLYDIR='^\.d\.\.t'
+export NEWFILE='>f+++++++++'
+export NEWDIR='cd+++++++++'
+export DELETECODE='*deleting'
+
+# functions
+
+function debug {
+  test "$DEBUG" -ge $1
+}
+
+function git_checkout {
+  debug 5 && echo "DEBUG -- entered git_checkout"
+  cd $GITDB || exit 1
+  $GIT checkout $1
+}
+
+function inotify_wait {
+  $INOTIFYWAIT $BASEDIR >$INOTFILE 2>&1
+  RVAL=$?
+  debug 7 && cat $INOTFILE | awk '{print " inotify : " $0}'
+  test $RVAL -eq 2 && no_local_change
+}
+
+function no_local_change {
+  debug 5 && echo "DEBUG -- entered no_local_change"
+  debug 2 || return
+  echo -n "`date` : pid = $$ : "
+  echo    "no changes to BASEDIR in $INOTIFYSECONDS seconds"
+} 
+
+function log_changes {
+  debug 5 && echo "DEBUG -- entered log_changes"
+  log_remote_changes ; log_local_changes
+}
+
+function log_local_changes {
+  debug 5 && echo "DEBUG -- entered log_local_changes"
+  if test -s $RSYNCOUT ; then
+     echo ">> START RSYNC $BASEDIR --> $GITDB --"
+     cat $RSYNCOUT | awk '{print "   update gitdb : " $0}'
+     echo ">> END   RSYNC $BASEDIR --> $GITDB --"
+  fi
+}
+
+function log_remote_changes {
+  debug 5 && echo "DEBUG -- entered log_remote_changes"
+  if test -s $RSYNCIN ; then
+     echo "<< START RSYNC $BASEDIR <-- $GITDB --"
+     cat $RSYNCIN | awk '{print "   update datadir : " $0}'
+     echo "<< END   RSYNC $BASEDIR <-- $GITDB --"
+  fi
+}
+
+function git_push {
+  debug 5 && echo "DEBUG -- entered git_push"
+  test -n "$PUSHPEERS"    || return
+  NEWBRANCH="`hostname``date +%s`"
+  $GIT branch $NEWBRANCH
+  for p in $PUSHPEERS ; do $GIT push $p $NEWBRANCH 2>&1; done > $GITPUSH
+  $GIT branch --delete $NEWBRANCH
+  debug 2 && awk '{print "gitpush : " $0}' $GITPUSH
+}
+
+function git_pull {
+  debug 5 && echo "DEBUG -- entered git_pull"
+  test "$SYNCMODE" = "wo" && return
+  for p in $PULLPEERS ; do $GIT pull $p $GITBRANCH 2>&1 ; done > $GITPULL
+  debug 2 && awk '{print "gitpull : " $0}' $GITPULL
+}
+
+function git_merge { # any peers push changes to you?
+  debug 5 && echo "DEBUG -- entered git_merge"
+  $GIT branch | grep -w -v $GITBRANCH | while read branch ; do
+    test "$SYNCMODE" != "wo" && $GIT merge $branch 
+    $GIT branch --delete $branch
+  done > $GITMERGE
+  debug 2 && awk '{print "gitmerge : " $0}' $GITMERGE
+}
+
+function git_delete {
+  f=$1
+  debug 5 && echo "DEBUG -- entered git_delete $f"
+  COMMITMSG="gitsync `hostname` rm $1"
+  cd $GITDB && $GIT rm $f && $GIT commit -m "$COMMITMSG"
+}
+
+function git_update {
+  debug 5 && echo "DEBUG -- entered git_update $1"
+  COMMITMSG="gitsync `hostname` add $1"
+  if test -d $BASEDIR/$1 ; then mkdir -p $GITDB/$1 ; return ; fi
+  if test -f $BASEDIR/$1 ; then cp $BASEDIR/$1 $GITDB/$1    ; fi
+  cd $GITDB && $GIT add $1 && $GIT commit -m "$COMMITMSG"
+}
+function timeonly {
+  debug 5 && echo "DEBUG -- entered timeonly $1"
+  test `echo "$1" | grep -w --count --regexp $TIMEONLY`    -gt 0 && return 0
+  test `echo "$1" | grep -w --count --regexp $TIMEONLYDIR` -gt 0 && return 0
+  return 1
+}
+
+function local_delete {
+  debug 5 && echo "DEBUG -- entered local_delete $1"
+  grep -w "$1" $RSYNCOUT | grep -w $DELETECODE
+}
+
+function local_add {
+  debug 5 && echo "DEBUG -- entered local_add $1"
+  grep -w "$1" $RSYNCOUT | grep -w $NEWFILE && return 0
+  grep -w "$1" $RSYNCOUT | grep -w $NEWDIR  && return 0
+  return 1
+}
+
+function local_modify {
+  debug 5 && echo "DEBUG -- entered local_modify $1"
+  C=`grep -w "$1" $RSYNCOUT | awk '{print $1}'`
+  test -n "$C" || return 1  # not in file, not a local change
+  timeonly $C  && return 1  # only timestamp change , not a local change
+  test -n "`echo $C | awk '$1 ~ /^.f/'`"
+}
+
+function remote_add {
+  debug 5 && echo "DEBUG -- entered remote_add $1"
+  test "$1" = $NEWFILE || test "$1" = $NEWDIR
+}
+
+function file_in_conflict {
+  f=$1
+  grep -we '^=======' $GITDB/$f && 
+  grep -we '^<<<<<<<' $GITDB/$f && 
+  grep -we '^>>>>>>>' $GITDB/$f
+}
+
+function copy_from_gitdb {
+  f=$1
+  if test -f $GITDB/$f ; then 
+     file_in_conflict $f && return
+     cp $GITDB/$f $BASEDIR/$f 
+     return 
+  fi
+  if test -d $GITDB/$f ; then 
+     mkdir -p $BASEDIR/$f
+     return 
+  fi
+}
+
+function process_remote_add_ro {
+  c=$1 ; f=$2
+  debug 5 && echo "DEBUG -- entered process_remote_add_ro $c $f"
+  copy_from_gitdb $f
+}
+
+function process_remote_add_wo {
+  c=$1 ; f=$2
+  debug 5 && echo "DEBUG -- entered process_remote_add_wo $c $f"
+  if local_delete $f ; then git_delete $f ; return ; fi
+  if local_modify $f ; then git_update $f ; return ; fi
+}
+
+function process_remote_add_rw {
+  c=$1 ; f=$2
+  debug 5 && echo "DEBUG -- entered process_remote_add_rw $c $f"
+  process_remote_add_wo $c $f
+  process_remote_add_ro $c $f
+}
+
+function process_remote_add {
+  c=$1 ; f=$2
+  debug 5 && echo "DEBUG -- entered process_remote_add $c $f"
+  if test "$SYNCMODE" = "ro" ; then process_remote_add_ro $c $f ; return ; fi
+  if test "$SYNCMODE" = "wo" ; then process_remote_add_wo $c $f ; return ; fi
+  if test "$SYNCMODE" = "rw" ; then process_remote_add_rw $c $f ; return ; fi
+}
+
+function remote_delete {
+  debug 5 && echo "DEBUG -- entered remote_delete $1"
+  test "$1" = $DELETECODE
+}
+
+function process_remote_delete_ro {
+  c=$1 ; f=$2
+  debug 5 && echo "DEBUG -- entered process_remote_delete_ro $c $f"
+  rm -f $BASEDIR/$f
+}
+
+function process_remote_delete_wo {
+  c=$1 ; f=$2
+  debug 5 && echo "DEBUG -- entered process_remote_delete_wo $c $f"
+  if local_add $f ; then git_update $f ; return ; fi
+}
+
+function process_remote_delete_rw {
+  c=$1 ; f=$2
+  debug 5 && echo "DEBUG -- entered process_remote_delete_rw $c $f"
+  if local_add $f ; then 
+     git_update $f 
+  else 
+     rm -f $BASEDIR/$f
+  fi
+}
+
+function process_remote_delete {
+  c=$1 ; f=$2
+  debug 5 && echo "DEBUG -- entered process_remote_delete $c $f"
+  if test "$SYNCMODE" = "ro" ; then process_remote_delete_ro $c $f ; return ; fi
+  if test "$SYNCMODE" = "wo" ; then process_remote_delete_wo $c $f ; return ; fi
+  if test "$SYNCMODE" = "rw" ; then process_remote_delete_rw $c $f ; return ; fi
+}
+
+function remote_modify {
+  debug 5 && echo "DEBUG -- entered remote_modify $1"
+  test -n "`echo "$1" | awk '$1 ~ /^.f/'`"
+}
+
+function process_remote_modify_ro {
+  c=$1 ; f=$2
+  debug 5 && echo "DEBUG -- entered process_remote_modify_ro $c $f"
+  copy_from_gitdb $f
+}
+
+function process_remote_modify_wo {
+  c=$1 ; f=$2
+  debug 5 && echo "DEBUG -- entered process_remote_modify_wo $c $f"
+  if local_modify $f ; then git_update $f ; return ; fi
+}
+
+function process_remote_modify_rw {
+  c=$1 ; f=$2
+  debug 5 && echo "DEBUG -- entered process_remote_modify_rw $c $f"
+  process_remote_modify_wo $c $f
+  process_remote_modify_ro $c $f
+}
+
+function process_remote_modify {
+  c=$1 ; f=$2
+  debug 5 && echo "DEBUG -- entered process_remote_modify $c $f"
+  if test "$SYNCMODE" = "ro" ; then process_remote_modify_ro $c $f ; return ; fi
+  if test "$SYNCMODE" = "wo" ; then process_remote_modify_wo $c $f ; return ; fi
+  if test "$SYNCMODE" = "rw" ; then process_remote_modify_rw $c $f ; return ; fi
+}
+
+function valid_input {
+  CODE=$1
+  FNAME=$2
+  debug 5 && echo "DEBUG -- entered valid_input $CODE $FNAME"
+  valid_code $CODE  || return 1
+  valid_file $FNAME || return 1
+  return 0
+}
+
+function valid_file {
+  debug 5 && echo "DEBUG -- entered valid_file $1"
+  test -n "`echo $1 | awk '$1 ~ /[a-zA-Z_-]/'`" || return 1
+  return 0
+}
+
+function valid_code {
+  debug 5 && echo "DEBUG -- entered valid_code $1"
+  timeonly $1 && return 1 # only timestamp differs
+  test "$1" = $DELETECODE ||
+    test -n "`echo $1 | awk 'length($1) == 11'`" || return 1
+  return 0
+}
+
+function gitstuff {
+  . $CONFIG
+  cd $GITDB && $GIT gc # garbage collection
+  # collect local changes before pulling from peers -- dry run
+  $RSYNC $RSYNCOPTS "$BASEDIR/" "$GITDB/"           > $RSYNCOUT 2>&1
+  git_pull   # see config file for peers from which to pull
+  git_merge  # any peers push changes to you?
+  $RSYNC $RSYNCOPTS "$GITDB/" "$BASEDIR/" > $RSYNCIN  2>&1
+  debug 3 && log_changes
+  awk 'NF == 2' $RSYNCIN | while read c f ; do valid_input $c $f || continue
+      if remote_add    $c ; then process_remote_add    $c $f ; continue ; fi
+      if remote_delete $c ; then process_remote_delete $c $f ; continue ; fi
+      if remote_modify $c ; then process_remote_modify $c $f ; continue ; fi
+  done
+  git_push   # see config file for peers to which to push
+  echo " "
+}
+
+# $PANIC stops all processing
+#
+if test -f $PANIC ; then 
+   echo "`date` .. panic" 
+   touch $DUMMY # trip inotify
+   exit 
+fi
+
+# check for lockfile, if there, parse it
+#  if in the correct format, test if pid and ppid are still valid
+#    if so, report status and exit
+#    if not, restart process
+#   this code should correctly restart service on reboot
+#
+if test -f $LOCKFILE ; then
+   PARENT=`cat $LOCKFILE | awk '{print $1}'`
+   PID=`cat $LOCKFILE    | awk '{print $2}'`
+   if test -n "$PID" && test -n "$PARENT"; then
+      for p in `pgrep -P $PARENT` ; do 
+        if test "$p" = "$PID" ; then
+           echo -e "\n`date` : $BASEDIR watched pid = $PID"
+           touch $DUMMY # trip inotify
+           exit
+        fi
+      done
+   fi
+fi
+
+#  lockfile missing or invalid or stale
+#   restart service
+echo "$PPID $$" > $LOCKFILE
+debug 1 && echo "`date` : $BASEDIR being watched STARTING pid = $$"
+
+while true ; do
+  if test -f $PANIC ; then echo "`date` .. panic .. exiting pid $$" ; exit ; fi
+  inotify_wait
+  ( 
+    flock -n 9 || exit 1
+    gitstuff
+  ) 9>$SETLOCKFILE
+done
+ 

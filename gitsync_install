@@ -1,0 +1,150 @@
+#!/bin/bash
+#
+#  install gitsync for current directory
+#
+#
+
+BASEDIR=`pwd`
+GITSYNCDIR=$BASEDIR/.gitsync
+GITSYNC=/usr/local/bin/gitsync
+DATADIR=`pwd | awk -F"/" '{for ( i = 4 ; i <= NF ; i++ ) {
+				if ( length( o ) ) { o = o "/" }
+				o = o $i
+			   }
+			   print o}'`
+
+LOGDIR=$GITSYNCDIR/log
+LOGFILE=$LOGDIR/logfile
+GITBRANCH=gitsync
+GITDB=$GITSYNCDIR/gitdb
+CONFIG=$GITSYNCDIR/config
+
+function sshpush {
+  cd $GITSYNCDIR
+  rm -rf ./gitcopy && git clone gitdb ./gitcopy
+  tar -czf gitcopy.tzf gitcopy/ 
+  rm -rf ./gitcopy 
+  DIR="$REMOTEDIR/.gitsync/gitdb"
+  ssh $REMOTEUSER@$REMOTEHOST "rm -rf $REMOTEDIR && mkdir -p $DIR "
+  scp gitcopy.tzf $REMOTEUSER@$REMOTEHOST:$REMOTEDIR/.gitsync/
+  ssh $REMOTEUSER@$REMOTEHOST "cd $REMOTEDIR/.gitsync && mkdir -p log && tar -xf gitcopy.tzf &&  rm -rf gitdb && mv gitcopy gitdb && cd gitdb"
+  cd gitdb  
+  git remote add $REMOTEHOST $REMOTEUSER@$REMOTEHOST:$REMOTEDIR/.gitsync/gitdb
+  git push --set-upstream $REMOTEHOST $GITBRANCH
+}
+
+function write_config {
+  echo -e "#!/bin/bash\n#\n#  config\n#\n#\n"      > $CONFIG
+  echo "export RSYNC=/usr/bin/rsync"              >> $CONFIG
+  echo "export GIT=/usr/bin/git"                  >> $CONFIG
+  echo "export LOGFILE=$LOGDIR/logfile"           >> $CONFIG
+  echo "export GITBRANCH=$GITBRANCH"              >> $CONFIG
+  echo "export PULLPEERS=''"                      >> $CONFIG
+  echo "export PUSHPEERS=''"                      >> $CONFIG
+  echo "#export PULLPEERS='venus pluto'"          >> $CONFIG
+  echo "#export PUSHPEERS='mercury openvpn'"      >> $CONFIG
+  echo "export GITDB=$GITDB"                      >> $CONFIG
+  echo "export BASEDIR=$BASEDIR"                  >> $CONFIG
+  echo "export DUMMY=$BASEDIR/.ImAdummyfile"      >> $CONFIG
+  echo "export GITSYNC=$GITSYNC"                  >> $CONFIG
+  echo "export GITSYNCDIR=$GITSYNCDIR"            >> $CONFIG
+  echo "export PANIC=$GITSYNCDIR/panic"           >> $CONFIG
+  echo "export CONFIG=$GITSYNCDIR/config"         >> $CONFIG
+  echo "export RSYNCIN=$GITSYNCDIR/rsyncin"       >> $CONFIG
+  echo "export RSYNCOUT=$GITSYNCDIR/rsyncout"     >> $CONFIG
+  echo "export GITPULL=$GITSYNCDIR/gitpull"       >> $CONFIG
+  echo "export GITPUSH=$GITSYNCDIR/gitpush"       >> $CONFIG
+  echo "export GITMERGE=$GITSYNCDIR/gitmerge"     >> $CONFIG
+  echo "export LOCKFILE=$GITSYNCDIR/lockfile"     >> $CONFIG
+  echo "export SETLOCKFILE=$GITSYNCDIR/setlockfile" >> $CONFIG
+  echo "export INOTFILE=$GITSYNCDIR/inotifywait"  >> $CONFIG
+  echo "export SYNCMODE=$SYNCMODE"                >> $CONFIG
+  echo "export DEBUG=5"                           >> $CONFIG
+
+}
+
+function usage {
+  echo "USAGE: gitsync_install [push|pull] [user host directory]"
+  echo " no args .. initialize from current directory to local gitdb (wo)"
+  echo " pull .. initialize from remote host (ro)"
+  echo " push .. initialize remote host from current directory and gitdb"
+  echo "$1"
+  exit
+}
+
+function gitinit {
+  cd $GITDB
+  rsync -av --exclude=.gitsync "$BASEDIR/" .
+  git init 
+  git config --global user.email "username@domain.com"
+  git config --global user.name "username"
+  git add --all
+  git commit -m 'genesis'
+  git branch $GITBRANCH
+  git checkout $GITBRANCH
+  echo -n "         cronentry: * * * * * . $GITSYNCDIR/config "
+  echo    '&& $GITSYNC >> $LOGFILE 2>&1'
+}
+
+function gitclone {
+  cd $GITSYNCDIR
+  REMOTE="$REMOTEUSER@$REMOTEHOST:$REMOTEDIR/.gitsync/gitdb" 
+  echo "attempting to clone from $REMOTE"
+  git clone $REMOTE 
+  cd $GITDB
+  git checkout $GITBRANCH
+  git remote add $2 $REMOTE
+  echo "export PULLPEERS=\"$PULLPEERS $2\"" >> $CONFIG
+}
+
+PUSHPULL=$1
+REMOTEUSER=$2
+REMOTEHOST=$3
+REMOTEDIR=$4
+FILECOUNT=`find . -type f | wc -l`
+
+if test -n "$1" ; then
+   SYNCMODE=ro
+   test $1 = "pull" || test $1 = "push" || usage
+   MSG="directory not empty .. can pull into empty directory (only)"
+   test $1 = "pull" && test "$FILECOUNT" -gt "0" && usage "$MSG"
+   MSG="directory empty .. nothing to push "
+   test $1 = "push" && test "$FILECOUNT" = "0"   && usage "$MSG"
+   MSG="unable to ssh to $REMOTEUSER@$REMOTEHOST"
+   ssh $REMOTEUSER@$REMOTEHOST "date" || usage "$MSG"
+else
+   MSG="empty directory nothing to initialize"
+   test "$FILECOUNT" -gt 0 || usage "$MSG"
+   SYNCMODE=wo
+fi
+    
+if test "$1" = 'pull' || test -z "$1" ; then
+   rm -rf $GITSYNCDIR
+   mkdir -p $GITDB
+   mkdir -p $LOGDIR
+   echo "LOGFILE for $BASEDIR" > $LOGFILE
+fi
+
+if test "$1" = 'pull' ; then
+   write_config 
+   gitclone $REMOTEUSER $REMOTEHOST $REMOTEDIR || exit
+   echo -n "         cronentry: * * * * * . $GITSYNCDIR/config "
+   echo    '&& $GITSYNC >> $LOGFILE 2>&1'
+fi
+
+if test "$1" = 'push' ; then
+   sshpush || exit
+   CONFIG=$GITSYNCDIR/remoteconfig
+   write_config
+   scp $CONFIG $REMOTEUSER@$REMOTEHOST:$REMOTEDIR/.gitsync/config
+   echo " "
+   CONFIG=$GITSYNCDIR/config
+   echo export PUSHPEERS=\"$PUSHPEERS $REMOTEHOST\" >> $CONFIG
+   echo "Still todo : "
+   echo "         log in to $REMOTEHOST"
+   echo -n "         cronentry: * * * * * . $GITSYNCDIR/config "
+   echo    '&& $GITSYNC >> $LOGFILE 2>&1'
+fi
+
+test -z "$1" && write_config && gitinit
+
